@@ -12,8 +12,9 @@
   css restart <name> [--detach] [--notify <名前>]
                                  停止して起動し直す（自分自身なら --detach。--notify で完了を知らせさせる）
   css remove <name> [--force]    停止して台帳から削除（会話自体は消さない）
-  css set <name> [--[no-]autostart] [--arg=...]... [--clear-args]
-                                 復元対象の切り替え・claude への追加引数の変更
+  css set <name> [--[no-]autostart] [--arg=...]... [--clear-args] [--desktop <名前|番号>] [--clear-desktop]
+                                 復元対象の切り替え・claude への追加引数・起動先の仮想デスクトップ（Windows）の変更
+  css desktops                   仮想デスクトップの一覧（Windows）
   css restore [--update] [--delay <秒>]
                                  autostart のうち止まっているものを全部起動
   css restart-all [--no-update]  全部閉じる → claude update → 全部復活
@@ -125,6 +126,55 @@ def close_mac_window(session_id: str) -> None:
                        capture_output=True, stdin=subprocess.DEVNULL, env=clean_env())
 
 
+def terminal_windows() -> dict[int, str]:
+    """Windows: Windows Terminal のトップレベルウィンドウ {hwnd: タイトル}。"""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    found: dict[int, str] = {}
+    proc_t = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(hwnd, _):
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        if cls.value == "CASCADIA_HOSTING_WINDOW_CLASS":
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, title, 512)
+            found[int(hwnd)] = title.value
+        return True
+
+    user32.EnumWindows(proc_t(cb), 0)
+    return found
+
+
+def move_to_desktop(entry: dict, before: dict[int, str], timeout: float = 20) -> str:
+    """Windows: 起動後に新しく現れた Windows Terminal のウィンドウを、台帳の desktop へ移す。
+    非公開 API を使うので失敗しうる。失敗しても起動自体は成功のまま、理由を返す。"""
+    target = entry.get("desktop")
+    if not target or not IS_WIN:
+        return ""
+    hwnd = None
+
+    def find() -> bool:
+        nonlocal hwnd
+        new = {h: t for h, t in terminal_windows().items() if h not in before}
+        named = [h for h, t in new.items() if entry["name"] in t]
+        pick = named or (list(new) if len(new) == 1 else [])
+        if pick:
+            hwnd = pick[0]
+        return hwnd is not None
+
+    if not wait_until(find, timeout, interval=0.3):
+        return "failed: 新しいウィンドウが見つからない"
+    out = subprocess.run(["pwsh", "-NoProfile", "-File", str(APP_DIR / "windows" / "vdesk.ps1"),
+                          "move", str(hwnd), str(target)],
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         stdin=subprocess.DEVNULL, env=clean_env(), timeout=60)
+    if out.returncode != 0:
+        return "failed: " + (out.stderr or out.stdout).strip().splitlines()[-1]
+    return f"moved: {target}"
+
+
 def open_window(entry: dict, prompt: str | None = None) -> None:
     """prompt を渡すと、起動直後にそれを最初の入力として送る（再起動完了の通知などに使う）。"""
     # 名前・追加引数・プロンプトには空白や日本語が入るので、コマンドラインでは渡さない。
@@ -209,11 +259,14 @@ def start(entry: dict, timeout: float = 60, prompt: str | None = None) -> dict:
     live = live_sessions()
     if entry["sessionId"] in live:
         return {"name": entry["name"], "result": "already-running"}
+    before = terminal_windows() if IS_WIN and entry.get("desktop") else {}
     open_window(entry, prompt)
+    desktop = move_to_desktop(entry, before)
     ok = wait_until(lambda: entry["sessionId"] in live_sessions(), timeout)
+    extra = {"desktop": desktop} if desktop else {}
     if ok:
-        return {"name": entry["name"], "result": "started"}
-    return {"name": entry["name"], "result": "start-timeout",
+        return {"name": entry["name"], "result": "started", **extra}
+    return {"name": entry["name"], "result": "start-timeout", **extra,
             "hint": "初めて使うフォルダだと、ウィンドウが「このフォルダを信頼しますか？」で止まっている。"
                     "人に承認してもらってから `list` で running になったか確認する。"}
 
@@ -264,7 +317,7 @@ def restart_all(update: bool, log) -> list[dict]:
     results = []
     for e in targets:
         r = start(e)
-        log(f"start {e['name']}: {r['result']}")
+        log(f"start {e['name']}: {r['result']}" + (f" desktop={r['desktop']}" if r.get("desktop") else ""))
         results.append(r)
     return results
 
@@ -307,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     a.add_argument("cwd")
     a.add_argument("--start", action="store_true")
     a.add_argument("--no-autostart", action="store_true")
+    a.add_argument("--desktop", help="Windows: 起動先の仮想デスクトップ（名前か 1 始まりの番号）")
     a.add_argument("--arg", action="append", default=[], dest="args",
                    help="claude に渡す追加引数（例: --arg=--model --arg=opus）")
     ad = sub.add_parser("adopt")
@@ -335,6 +389,9 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--arg", action="append", default=[], dest="args",
                     help="claude に渡す追加引数を置き換える（例: --arg=--model --arg=haiku）")
     st.add_argument("--clear-args", action="store_true", help="追加引数を空にする")
+    st.add_argument("--desktop", help="Windows: 起動先の仮想デスクトップ（名前か番号）")
+    st.add_argument("--clear-desktop", action="store_true", help="起動先の仮想デスクトップ指定を外す")
+    sub.add_parser("desktops", help="Windows: 仮想デスクトップの一覧")
     rst = sub.add_parser("restore")
     rst.add_argument("--update", action="store_true", help="起動する前に claude update する")
     rst.add_argument("--delay", type=int, default=0, metavar="SEC",
@@ -367,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise CssError(f"ディレクトリがありません: {cwd}")
             entry = {"name": args.name, "cwd": cwd, "sessionId": str(uuid.uuid4()),
                      "autostart": not args.no_autostart, "args": args.args}
+            if args.desktop:
+                entry["desktop"] = args.desktop
             entries.append(entry)
             save_registry(entries)
             res = {"added": entry}
@@ -390,7 +449,10 @@ def main(argv: list[str] | None = None) -> int:
                 # 今の場所（VS Code など）で止めて、独立したウィンドウで会話の続きから起動する
                 res["stop"] = stop(entry)["result"]
                 if res["stop"] in ("stopped", "not-running"):
-                    res["start"] = start(entry)["result"]
+                    s = start(entry)
+                    res["start"] = s["result"]
+                    if s.get("desktop"):
+                        res["desktop"] = s["desktop"]
                 emit(res, f"取り込みました: {args.name}（stop: {res['stop']}, start: {res.get('start', '-')}）")
             else:
                 emit(res, f"取り込みました: {args.name}（次回の再起動からウィンドウで動きます）")
@@ -414,11 +476,16 @@ def main(argv: list[str] | None = None) -> int:
                                   f"{args.notify} に SendMessage（宛先は名前）で、再起動が終わって"
                                   f"稼働中であることを知らせてください。確かめた事実だけを書き、"
                                   f"相手に届いたかどうかなど自分にわからないことは書かないでください。")
-                    r["start"] = start(entry, prompt=prompt)["result"]
-                emit(r, f"{args.name}: stop={r['stop']} start={r.get('start', '-')}")
+                    s = start(entry, prompt=prompt)
+                    r["start"] = s["result"]
+                    if s.get("desktop"):
+                        r["desktop"] = s["desktop"]
+                emit(r, f"{args.name}: stop={r['stop']} start={r.get('start', '-')}"
+                        + (f" desktop={r['desktop']}" if r.get("desktop") else ""))
         elif args.cmd == "start":
             r = start(find_entry(load_registry(), args.name))
-            emit(r, f"{r['name']}: {r['result']}" + (f"\n{r['hint']}" if r.get("hint") else ""))
+            emit(r, f"{r['name']}: {r['result']}" + (f"（desktop {r['desktop']}）" if r.get("desktop") else "")
+                 + (f"\n{r['hint']}" if r.get("hint") else ""))
         elif args.cmd == "stop":
             r = stop(find_entry(load_registry(), args.name), force=args.force)
             emit(r, f"{r['name']}: {r['result']}")
@@ -436,13 +503,27 @@ def main(argv: list[str] | None = None) -> int:
             e = find_entry(entries, args.name)
             if args.autostart is not None:
                 e["autostart"] = args.autostart
+            if args.clear_desktop:
+                e.pop("desktop", None)
+            if args.desktop:
+                e["desktop"] = args.desktop
             if args.clear_args:
                 e["args"] = []
             if args.args:
                 e["args"] = args.args
             save_registry(entries)
             emit(e, f"{args.name}: autostart={'on' if e.get('autostart', True) else 'off'} "
-                    f"args={e.get('args', [])}（args の変更は次の起動から有効）")
+                    f"args={e.get('args', [])} desktop={e.get('desktop', '-')}（args / desktop の変更は次の起動から有効）")
+        elif args.cmd == "desktops":
+            if not IS_WIN:
+                raise CssError("仮想デスクトップの指定は Windows のみ対応です")
+            out = subprocess.run(["pwsh", "-NoProfile", "-File", str(APP_DIR / "windows" / "vdesk.ps1"), "list"],
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                 stdin=subprocess.DEVNULL, env=clean_env(), timeout=60)
+            if out.returncode != 0:
+                raise CssError("仮想デスクトップを取得できません: " + (out.stderr or out.stdout).strip())
+            rows = json.loads(out.stdout)
+            emit(rows, "\n".join(f"{r['index']}: {r['name'] or '(名前なし)'}" for r in rows))
         elif args.cmd == "restore":
             if args.delay > 0:
                 time.sleep(args.delay)
@@ -454,7 +535,8 @@ def main(argv: list[str] | None = None) -> int:
                    if e.get("autostart", True) and e["sessionId"] not in live]
             # ログイン時にログファイルへ追記されていくので、行頭に時刻を付ける
             ts = f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] restore: "
-            emit(res, "\n".join(ts + f"{r['name']}: {r['result']}" for r in res)
+            emit(res, "\n".join(ts + f"{r['name']}: {r['result']}"
+                                + (f" desktop={r['desktop']}" if r.get("desktop") else "") for r in res)
                  or ts + "起動が必要なセッションはありません")
         elif args.cmd == "restart-all":
             log_path = Path(args.log) if args.log else \
