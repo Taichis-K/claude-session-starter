@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(.\\windows\\css.cmd *)",
+      "Bash(python3 css.py *)"
+    ]
+  }
+}
