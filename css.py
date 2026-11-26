@@ -96,8 +96,49 @@ def live_sessions() -> dict[str, dict]:
     if out.returncode != 0:
         raise CssError(f"claude agents に失敗: {out.stderr.strip()}")
     # 終了直後のセッションがしばらく一覧に残るので、プロセスが消えたものは除く
-    return {s["sessionId"]: s for s in json.loads(out.stdout or "[]")
+    live = {s["sessionId"]: s for s in json.loads(out.stdout or "[]")
             if s.get("pid") and pid_alive(s["pid"])}
+    follow_session_changes(live)
+    return live
+
+
+def _same_dir(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
+def follow_session_changes(live: dict[str, dict]) -> None:
+    """/clear などで会話が切り替わると、同じプロセスのまま sessionId が変わる。
+    台帳の sessionId が動いていないとき、同じ名前・同じフォルダで動いているセッションが 1 つだけあれば、
+    それを同じセッションとみなして台帳の sessionId を書き換える（以後の停止・再起動は新しい会話を扱う）。"""
+    entries = load_registry()
+    claimed = {e["sessionId"] for e in entries}
+    changed = False
+    for e in entries:
+        if e["sessionId"] in live:
+            continue
+        cands = [s for s in live.values()
+                 if s.get("name") == e["name"] and _same_dir(s.get("cwd", ""), e["cwd"])
+                 and s["sessionId"] not in claimed]
+        if len(cands) == 1:
+            old, new = e["sessionId"], cands[0]["sessionId"]
+            claimed.discard(old)
+            e["sessionId"] = new
+            claimed.add(new)
+            changed = True
+            # mac: ウィンドウ ID の控えは sessionId 名なので付け替える（しないと stop で古いウィンドウが閉じない）
+            src = DATA_DIR / "windows" / old
+            if src.exists() and not (DATA_DIR / "windows" / new).exists():
+                src.rename(DATA_DIR / "windows" / new)
+    if changed:
+        save_registry(entries)
+
+
+def refresh(entry: dict) -> dict:
+    """台帳から最新の内容を読み直す（follow_session_changes で sessionId が変わっていることがある）。"""
+    for e in load_registry():
+        if e["name"] == entry["name"]:
+            return e
+    return entry
 
 
 def has_transcript(session_id: str) -> bool:
@@ -257,6 +298,7 @@ def wait_until(pred, timeout: float, interval: float = 2.0) -> bool:
 
 def start(entry: dict, timeout: float = 60, prompt: str | None = None) -> dict:
     live = live_sessions()
+    entry = refresh(entry)
     if entry["sessionId"] in live:
         return {"name": entry["name"], "result": "already-running"}
     before = terminal_windows() if IS_WIN and entry.get("desktop") else {}
@@ -273,8 +315,10 @@ def start(entry: dict, timeout: float = 60, prompt: str | None = None) -> dict:
 
 def stop(entry: dict, force: bool = False, idle_timeout: float = 1800) -> dict:
     # claude agents は 1 回 6 秒ほどかかるので、呼ぶ回数を最小にする
+    live = live_sessions()
+    entry = refresh(entry)
     sid = entry["sessionId"]
-    s = live_sessions().get(sid)
+    s = live.get(sid)
     deadline = time.monotonic() + idle_timeout
     while s and not force and s.get("status") == "busy":
         if time.monotonic() > deadline:
@@ -302,8 +346,8 @@ def status_rows() -> list[dict]:
 
 
 def restart_all(update: bool, log) -> list[dict]:
+    live = live_sessions()  # 先に呼ぶ（/clear で変わった sessionId を台帳に反映させてから読む）
     entries = load_registry()
-    live = live_sessions()
     # 止まっていたもの（autostart 対象）も含めて、最後に全部起動し直す
     targets = [e for e in entries if e["sessionId"] in live or e.get("autostart", True)]
     log(f"対象: {[e['name'] for e in targets]}")
